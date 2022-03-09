@@ -20,9 +20,7 @@
 ## save the file in any Datastore in a subfolder named check_mk_agent and start it Task -> Init/Shutdown Scripts as POSTINIT
 ## optional create a folder local in the check_mk_agent folder and execute local checks (subdirs for caching data supported)
 
-
-
-__VERSION__ = "0.38"
+__VERSION__ = "0.85"
 
 import sys
 import os
@@ -90,16 +88,25 @@ def pad_pkcs7(message,size=16):
     else:
         return message + bytes([_pad]) * _pad
 
+def check_pid(pid):
+    try:
+        os.kill(pid,0)
+        return True
+    except OSError: ## no permission check currently root
+        return False
+
 class checkmk_handler(StreamRequestHandler):
     def handle(self):
         with self.server._mutex:
             try:
                 _strmsg = self.server.do_checks(remote_ip=self.client_address[0])
             except Exception as e:
+                raise
                 _strmsg = str(e).encode("utf-8")
             try:
                 self.wfile.write(_strmsg)
             except:
+                raise
                 pass
 
 class checkmk_checker(object):
@@ -236,6 +243,100 @@ class checkmk_checker(object):
     def check_net(self):
         _now = int(time.time())
         _ret = ["<<<statgrab_net>>>"]
+        _interface_data = []
+        _interface_data = self._run_prog("/usr/bin/netstat -i -b -d -n -W -f link").split("\n")
+        _header = _interface_data[0].lower()
+        _header = _header.replace("pkts","packets").replace("coll","collisions").replace("errs","error").replace("ibytes","rx").replace("obytes","tx")
+        _header = _header.split()
+        _interface_stats = dict(
+            map(
+                lambda x: (x.get("name"),x),
+                [
+                    dict(zip(_header,_ifdata.split()))
+                    for _ifdata in _interface_data[1:] if _ifdata
+                ]
+            )
+        )
+
+        _ifconfig_out = self._run_prog("ifconfig -m -v")
+        _ifconfig_out += "END" ## fix regex
+        _all_interfaces = object_dict()
+        for _interface, _data in re.findall("^(?P<iface>[\w.]+):\s(?P<data>.*?(?=^\w))",_ifconfig_out,re.DOTALL | re.MULTILINE):
+            _interface_dict = object_dict()
+            _interface_dict.update(_interface_stats.get(_interface,{}))
+            _interface = _interface.replace(".","_")
+            _interface_dict["up"] = "false"
+            _interface_dict["systime"] = _now
+            for _key, _val in re.findall("^\s*(\w+)[:\s=]+(.*?)$",_data,re.MULTILINE):
+                if _key == "description":
+                    _interface_dict["interface_name"] = _val.strip().replace("associated with jail: ","jail_").replace(" as nic: ","#").replace(" ","_").replace(":","_")
+                if _key == "groups":
+                    _interface_dict["groups"] = _val.strip().split()
+                if _key == "ether":
+                    _interface_dict["phys_address"] = _val.strip()
+                if _key == "status" and _val.strip() == "active":
+                    _interface_dict["up"] = "true"
+                if _key == "flags":
+                    _interface_dict["flags"] = _val
+                if _key == "media":
+                    _match = re.search("\((?P<speed>\d+G?)base(?:.*?<(?P<duplex>.*?)>)?",_val)
+                    if _match:
+                        _interface_dict["speed"] = _match.group("speed").replace("G","000")
+                        _interface_dict["duplex"] = _match.group("duplex")
+                if _key == "inet":
+                    _match = re.search("^(?P<ipaddr>[\d.]+).*?netmask\s(?P<netmask>0x[0-9a-f]{8}).*?(?:vhid\s(?P<vhid>\d+)|$)",_val,re.M)
+                    if _match:
+                        _cidr = bin(int(_match.group("netmask"),16)).count("1")
+                        _ipaddr = _match.group("ipaddr")
+                        _vhid = _match.group("vhid")
+                        ## fixme ipaddr dict / vhid dict
+                if _key == "inet6":
+                    _match = re.search("^(?P<ipaddr>[0-9a-f]+).*?prefixlen\s(?P<prefix>\d+).*?(?:vhid\s(?P<vhid>\d+)|$)",_val,re.M)
+                    if _match:
+                        _ipaddr = _match.group("ipaddr")
+                        _prefix = _match.group("prefix")
+                        _vhid = _match.group("vhid")
+                        ## fixme ipaddr dict / vhid dict
+                if _key == "carp":
+                    _match = re.search("(?P<status>MASTER|BACKUP)\svhid\s(?P<vhid>\d+)\sadvbase\s(?P<base>\d+)\sadvskew\s(?P<skew>\d+)",_val,re.M)
+                    if _match:
+                        _carpstatus = _match.group("status")
+                        _vhid = _match.group("vhid")
+                        _advbase = _match.group("base")
+                        _advskew = _match.group("skew")
+                        ## fixme vhid dict
+                if _key == "id":
+                    _match = re.search("priority\s(\d+)",_val)
+                    if _match:
+                        _interface_dict["bridge_prio"] = _match.group(1)
+                if _key == "member":
+                    _member = _interface_dict.get("member",[])
+                    _member.append(_val.split()[0])
+                    _interface_dict["member"] = _member
+                if _key == "Opened":
+                    try:
+                        _pid = int(_val.split(" ")[-1])
+                        if check_pid(_pid):
+                            _interface_dict["up"] = "true"
+                    except ValueError:
+                        pass
+
+            #pprint(_interface_dict)
+            _all_interfaces[_interface] = _interface_dict
+            if re.search("^[*]?(pflog|pfsync|lo)\d?",_interface):
+                continue
+
+            for _key,_val in _interface_dict.items():
+                if _key in ("name","network","address","flags"):
+                    continue
+                if type(_val) in (str,int,float):
+                    _ret.append(f"{_interface}.{_key} {_val}")
+
+        return _ret
+
+    def _old_check_net(self):
+        _now = int(time.time())
+        _ret = ["<<<statgrab_net>>>"]
         _interface_status = dict(
             map(lambda x: (x[0],(x[1:])),
                 re.findall("^(?P<iface>[\w.]+):.*?(?P<adminstate>UP|DOWN),.*?\n(?:\s+(?:media:.*?(?P<speed>\d+G?).*?\<(?P<duplex>.*?)\>|(?:status:\s(?P<operstate>[ \w]+))|).*?\n)*",
@@ -289,12 +390,17 @@ class checkmk_checker(object):
                 pass
         return _ret
 
+    def check_df(self):
+        _ret = ["<<<df>>>"]
+        _ret += self._run_prog("df -kTP -t ufs").split("\n")[1:]
+        return _ret
+
     def check_kernel(self):
         _ret = ["<<<kernel>>>"]
         _out = self._run_prog("sysctl vm.stats",timeout=10)
         _kernel = dict([_v.split(": ") for _v in _out.split("\n") if len(_v.split(": ")) == 2])
         _ret.append("{0:.0f}".format(time.time()))
-        _ret.append("cpu {0} {1} {2} {4} {3}".format(*(_kernel.get("kern.cp_time","").split(" "))))
+        _ret.append("cpu {0} {1} {2} {4} {3}".format(*(self._run_prog("sysctl -n kern.cp_time","").split(" "))))
         _ret.append("ctxt {0}".format(_kernel.get("vm.stats.sys.v_swtch")))
         _sum = sum(map(lambda x: int(x[1]),(filter(lambda x: x[0] in ("vm.stats.vm.v_forks","vm.stats.vm.v_vforks","vm.stats.vm.v_rforks","vm.stats.vm.v_kthreads"),_kernel.items()))))
         _ret.append("processes {0}".format(_sum))
@@ -319,11 +425,6 @@ class checkmk_checker(object):
         _ret.append("swap.total 0")
         _ret.append("swap.used 0")
         
-        return _ret
-
-    def check_df(self):
-        _ret = ["<<<df>>>"]
-        _ret += self._run_prog("df -kTP -t ufs").split("\n")[1:]
         return _ret
 
     def check_zpool(self):
@@ -718,7 +819,8 @@ if __name__ == "__main__":
         os.kill(int(_pid),signal.SIGTERM)
 
     elif args.debug:
-        sys.stdout.buffer.write(_server.do_checks(debug=True))
+        sys.stdout.write(_server.do_checks(debug=True).decode(sys.stdout.encoding))
+        sys.stdout.flush()
     elif args.nodaemon:
         _server.server_start()
     else:
