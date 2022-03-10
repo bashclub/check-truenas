@@ -17,10 +17,11 @@
 ## GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
 ## LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+## TrueNAS CheckMK Agent
 ## save the file in any Datastore in a subfolder named check_mk_agent and start it Task -> Init/Shutdown Scripts as POSTINIT
 ## optional create a folder local in the check_mk_agent folder and execute local checks (subdirs for caching data supported)
 
-__VERSION__ = "0.85"
+__VERSION__ = "0.87"
 
 import sys
 import os
@@ -54,6 +55,7 @@ BASEDIR = os.path.dirname(SCRIPTPATH)
 if BASEDIR.endswith("/bin"):
     BASEDIR = BASEDIR[:-4]
 MK_CONFDIR = os.path.join(BASEDIR,"etc")
+CHECKMK_CONFIG = os.path.join(MK_CONFDIR,"checkmk.conf")
 LOCALDIR = os.path.join(BASEDIR,"local")
 SPOOLDIR = os.path.join(BASEDIR,"spool")
 
@@ -106,7 +108,6 @@ class checkmk_handler(StreamRequestHandler):
             try:
                 self.wfile.write(_strmsg)
             except:
-                raise
                 pass
 
 class checkmk_checker(object):
@@ -161,6 +162,8 @@ class checkmk_checker(object):
         for _check in dir(self):
             if _check.startswith("check_"):
                 _name = _check.split("_",1)[1]
+                if _name in self.skipcheck:
+                    continue
                 try:
                     _lines += getattr(self,_check)()
                 except:
@@ -171,6 +174,8 @@ class checkmk_checker(object):
         for _check in dir(self):
             if _check.startswith("checklocal_"):
                 _name = _check.split("_",1)[1]
+                if _name in self.skipcheck:
+                    continue
                 try:
                     _lines += getattr(self,_check)()
                 except:
@@ -334,49 +339,19 @@ class checkmk_checker(object):
 
         return _ret
 
-    def _old_check_net(self):
-        _now = int(time.time())
-        _ret = ["<<<statgrab_net>>>"]
-        _interface_status = dict(
-            map(lambda x: (x[0],(x[1:])),
-                re.findall("^(?P<iface>[\w.]+):.*?(?P<adminstate>UP|DOWN),.*?\n(?:\s+(?:media:.*?(?P<speed>\d+G?).*?\<(?P<duplex>.*?)\>|(?:status:\s(?P<operstate>[ \w]+))|).*?\n)*",
-                self._run_prog("ifconfig"),re.M)
-            )
-        )
-        _interface_data = self._run_prog("/usr/bin/netstat -i -b -d -n -W -f link").split("\n")
-        _header = _interface_data[0].lower()
-        _header = _header.replace("pkts","packets").replace("coll","collisions").replace("errs","error").replace("ibytes","rx").replace("obytes","tx")
-        _header = _header.split()
-
-        for _line in _interface_data[1:]:
-            _fields = _line.split()
-            if not _fields: 
-                continue
-            _iface = _fields[0]
-            if _iface.replace("*","") in ("pflog0","lo0"):
-                continue
-            _ifconfig = _interface_status.get(_iface,("","","unknown",""))
-            _iface = _iface.replace(".","_")
-            _ifacedict = dict(zip(_header,_fields))
-            _ifacedict.update({
-                "interface_name"    : _iface,
-                "duplex"            : _ifconfig[2],
-                "speed"             : _ifconfig[1].replace("G","000"),
-                "systime"           : _now,
-                "up"                : str(bool(_ifconfig[3] in ("active",""))).lower(),
-                "admin_status"      : str(bool(_ifconfig[0] == "UP")).lower(),
-                "phys_address"      : _ifacedict.get("address")
-            })
-            for _key,_val in _ifacedict.items():
-                if _key in ("name","network","address"):
-                    continue
-                if type(_val) == str:
-                    _val = _val.replace(" ","_")
-                if not _val:
-                    continue
-                _ret.append(f"{_iface}.{_key} {_val}")
-        return _ret
-
+    def checklocal_samba(self):
+        if not os.path.exists("/usr/local/bin/smbstatus"):
+            return []
+        try:
+            _json = self._run_prog("/usr/local/bin/smbstatus --json")
+            _data = json.loads(_json)
+            _locks = _data.get("locked_files",[])
+            _xlocks = len(list(filter(lambda x: True in x.get("oplock",{}).values(),_locks)))
+            _shared_locks = len(list(filter(lambda x: True not in x.get("oplock",{}).values(),_locks)))
+            _sessions = len(_data.get("sessions",[]))
+            return [f"0 Samba share_locks={_shared_locks}|exclusive_locks={_xlocks}|active_sessions={_sessions} {_sessions} User active"]
+        except:
+            return ["2 Samba share_locks=0|exclusive_locks=0|active_sessions=0 Server Error"]
 
     def check_smartinfo(self):
         if not os.path.exists("/usr/local/sbin/smartctl"):
@@ -388,6 +363,14 @@ class checkmk_checker(object):
                 _ret.append(str(smart_disc(_dev)))
             except:
                 pass
+        return _ret
+
+    def check_ipmi(self):
+        if not os.path.exists("/usr/local/bin/ipmitool"):
+            return []
+        _ret = ["<<<ipmi:sep(124)>>>"]
+        _out = self._run_prog("/usr/local/bin/ipmitool sensor list")
+        _ret += re.findall("^(?!.*\sna\s.*$).*",_out,re.M)
         return _ret
 
     def check_df(self):
@@ -570,9 +553,10 @@ class checkmk_cached_process(object):
         return _data
 
 class checkmk_server(TCPServer,checkmk_checker):
-    def __init__(self,port,pidfile,user,onlyfrom=None,encryptionkey=None,**kwargs):
+    def __init__(self,port,pidfile,user,onlyfrom=None,encryptionkey=None,skipcheck=None,**kwargs):
         self.pidfile = pidfile
-        self.onlyfrom=onlyfrom.split(",") if onlyfrom else None
+        self.onlyfrom = onlyfrom.split(",") if onlyfrom else None
+        self.skipcheck = skipcheck.split(",") if skipcheck else []
         self.encryptionkey = encryptionkey
         self._mutex = threading.Lock()
         self.user = pwd.getpwnam(user)
@@ -762,8 +746,16 @@ class smart_disc(object):
 
 if __name__ == "__main__":
     import argparse
+    class SmartFormatter(argparse.HelpFormatter):
+
+        def _split_lines(self, text, width):
+            if text.startswith('R|'):
+                return text[2:].splitlines()  
+            # this is the RawTextHelpFormatter._split_lines
+            return argparse.HelpFormatter._split_lines(self, text, width)
+    _checks_available = sorted(list(map(lambda x: x.split("_")[1],filter(lambda x: x.startswith("check_") or x.startswith("checklocal_"),dir(checkmk_checker)))))
     _ = lambda x: x
-    _parser = argparse.ArgumentParser(f"checkmk_agent for TrueNAS\nVersion: {__VERSION__}\n##########################################\n")
+    _parser = argparse.ArgumentParser(f"checkmk_agent for TrueNAS\nVersion: {__VERSION__}\n##########################################\n", formatter_class=SmartFormatter)
     _parser.add_argument("--port",type=int,default=6556,
         help=_("Port checkmk_agent listen"))
     _parser.add_argument("--start",action="store_true",
@@ -774,6 +766,8 @@ if __name__ == "__main__":
         help=_("run in foreground"))
     _parser.add_argument("--status",action="store_true",
         help=_("show status if running"))
+    _parser.add_argument("--config",type=str,dest="configfile",default=CHECKMK_CONFIG,
+        help=_("path to config file"))
     _parser.add_argument("--user",type=str,default="root",
         help=_(""))
     _parser.add_argument("--encrypt",type=str,dest="encryptionkey",
@@ -782,9 +776,26 @@ if __name__ == "__main__":
         help=_(""))
     _parser.add_argument("--onlyfrom",type=str,
         help=_("comma seperated ip addresses to allow"))
+    _parser.add_argument("--skipcheck",type=str,
+        help=_("R|comma seperated checks that will be skipped \n{0}".format("\n".join([", ".join(_checks_available[i:i+10]) for i in range(0,len(_checks_available),10)]))))
     _parser.add_argument("--debug",action="store_true",
         help=_("debug Ausgabe"))
     args = _parser.parse_args()
+    if args.configfile and os.path.exists(args.configfile):
+        for _k,_v in re.findall(f"^(\w+):\s*(.*?)(?:\s+#|$)",open(args.configfile,"rt").read(),re.M):
+            if _k == "port":
+                args.port = int(_v)
+            if _k == "encrypt":
+                args.encryptionkey = _v
+            if _k == "onlyfrom":
+                args.onlyfrom = _v
+            if _k == "skipcheck":
+                args.skipcheck = _v
+            if _k.lower() == "localdir":
+                LOCALDIR = _v
+            if _k.lower() == "spooldir":
+                SPOOLDIR = _v
+
     _server = checkmk_server(**args.__dict__)
     _pid = None
     try:
