@@ -21,7 +21,7 @@
 ## save the file in any Datastore in a subfolder named check_mk_agent and start it Task -> Init/Shutdown Scripts as POSTINIT
 ## optional create a folder local in the check_mk_agent folder and execute local checks (subdirs for caching data supported)
 
-__VERSION__ = "0.64"
+__VERSION__ = "1.2.9"
 
 import sys
 import os
@@ -50,6 +50,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from datetime import datetime
 from xml.etree import cElementTree as ELementTree
 from collections import Counter,defaultdict
+from middlewared.client import Client
 from pprint import pprint
 from socketserver import TCPServer,StreamRequestHandler
 ISLINUX=sys.platform == "linux"
@@ -141,6 +142,7 @@ class checkmk_handler(StreamRequestHandler):
 class checkmk_checker(object):
     _available_sysctl_list = []
     _available_sysctl_temperature_list = []
+    _ipaccess_log = {}
     _check_cache = {}
     def encrypt_msg(self,message,password='secretpassword'):
         SALT_LENGTH = 8
@@ -196,6 +198,18 @@ class checkmk_checker(object):
         except UnicodeDecodeError:
             return ("invalid key")
 
+    def _expired_lastaccesed(self,remote_ip):
+        _now = time.time()
+        _lastaccess = self._ipaccess_log.get(remote_ip,0)
+        _ret = True
+        if (_lastaccess + self.expire_inventory / 2) > _now:
+            _ret = False
+        for _ip, _time in self._ipaccess_log.items():
+            if (_time + self.expire_inventory + 600) < _now:
+                del self._ipaccess_log[_ip]
+        self._ipaccess_log[remote_ip] = _now
+        return _ret
+
     def do_checks(self,debug=False,remote_ip=None,**kwargs):
         self._getosinfo()
         _errors = []
@@ -238,6 +252,12 @@ class checkmk_checker(object):
                             _lines.append(self._run_prog(_plugin_file))
                     except:
                         _errors.append(traceback.format_exc())
+
+        if self._expired_lastaccesed(remote_ip):
+            try:
+                _lines += self.do_inventory()
+            except:
+                _errors.append(traceback.format_exc())
 
         _lines.append("<<<local:sep(0)>>>")
         for _check in dir(self):
@@ -313,21 +333,15 @@ class checkmk_checker(object):
         _allprogs = re.findall("(\w+)\s+(\d+)",self._run_prog("ps ax -c -o command,pid"))
         return int(dict(_allprogs).get(prog,default))
 
-    def _midclt(self,command,cachetime=0):
-        if cachetime == 0:
-            _res = self._run_prog(f"midclt call {command}")
-        else:
-            _res = self._run_cache_prog(f"midclt call {command}",cachetime=cachetime)
-        try:
-            return json.loads(_res)
-        except:
-            return {}
+    def _midclt(self,command,cachetime=0,*args):
+        with Client() as c:
+            return c.call(command,*args)
 
     def checklocal_firmware(self):
         if self._midclt("update.check_available",900).get("status","") == "UNAVAILABLE":
             return ["0 Firmware available=0 Version {0} up to date".format(self._info.get("os_version"))]
         else:
-            _pending = self._midclt("update.pending",9000).get("new",{})
+            _pending = self._midclt("update.get_pending",9000)[0].get("new",{})
             return ["1 Firmware available=1 Version {0} ({1} available)".format(self._info.get("os_version"),_pending.get("version",""))]
 
     def check_label(self):
@@ -536,10 +550,10 @@ class checkmk_checker(object):
 
     def check_ssh(self):
         _ret = ["<<<sshd_config>>>"]
-        with open("/etc/ssh/sshd_config","r") as _f:
-            for _line in _f.readlines():
-                if re.search("^[a-zA-Z]",_line):
-                    _ret.append(_line.replace("\n",""))
+        if ISLINUX:
+            _ret += self._run_cache_prog("sshd -T").splitlines()
+        else:
+            _ret += self._run_cache_prog("/usr/local/sbin/sshd -T").splitlines()
         return _ret
 
     def _check_bsd_kernel(self):
@@ -660,6 +674,23 @@ class checkmk_checker(object):
         _ret += open("/proc/uptime","rt").readlines()
         return _ret
 
+    def do_inventory(self):
+        _ret = []
+        _persist = int(time.time()) + self.expire_inventory + 600
+        if os.path.exists("/sbin/dmidecode") or os.path.exists("/usr/local/sbin/dmidecode") :
+            _ret += [f"<<<dmidecode:sep(58):persist({_persist})>>>"]
+            _ret += self._run_cache_prog("dmidecode -q",7200).replace("\t",":").splitlines()
+        _ret += [f"<<<lnx_distro:sep(124):persist({_persist})>>>"]
+        if os.path.exists("/etc/os-release"):
+            _ret.append("[[[/etc/os-release]]]")
+            _ret.append(open("/etc/os-release","rt").read().replace("\n","|"))
+        _ret += [f"<<<lnx_packages:sep(124):persist({_persist})>>>"]
+        if ISLINUX:
+            _ret += self._run_cache_prog("dpkg-query --show --showformat='${Package}|${Version}|${Architecture}|deb|-|${Summary}|${Status}\n'",1200).splitlines()
+        else:
+            _ret += list(map(lambda x: "{0}|{1}|amd64|freebsd|{2}|install ok installed".format(*x),re.findall("(\S+)-([0-9][0-9a-z._,-]+)\s*(.*)",self._run_cache_prog("pkg info",1200),re.M)))
+        return _ret
+
     def _run_prog(self,cmdline="",*args,shell=False,timeout=60,ignore_error=False):
         if type(cmdline) == str:
             _process = shlex.split(cmdline,posix=True)
@@ -737,11 +768,12 @@ class checkmk_cached_process(object):
         return _data
 
 class checkmk_server(TCPServer,checkmk_checker):
-    def __init__(self,port,pidfile,onlyfrom=None,encrypt=None,skipcheck=None,**kwargs):
+    def __init__(self,port,pidfile,onlyfrom=None,encrypt=None,skipcheck=None,expire_inventory=0,**kwargs):
         self.pidfile = pidfile
         self.onlyfrom = onlyfrom.split(",") if onlyfrom else None
         self.skipcheck = skipcheck.split(",") if skipcheck else []
         self.encrypt = encrypt
+        self.expire_inventory = expire_inventory
         self._mutex = threading.Lock()
         self.user = pwd.getpwnam("root")
         self.allow_reuse_address = True
@@ -860,7 +892,7 @@ class checkmk_server(TCPServer,checkmk_checker):
 
 
 REGEX_SMART_VENDOR = re.compile(r"^\s*(?P<num>\d+)\s(?P<name>[-\w]+).*\s{2,}(?P<value>[\w\/() ]+)$",re.M)
-REGEX_SMART_DICT = re.compile(r"^(.*?):\s*(.*?)$",re.M)
+REGEX_SMART_DICT = re.compile(r"^(.*?)[:=]\s*(.*?)$",re.M)
 class smart_disc(object):
     def __init__(self,device,description=""):
         self.device = device
@@ -888,7 +920,6 @@ class smart_disc(object):
             "Data Units Read"   : ("data_read_bytes"    ,lambda x: x.split(" ")[0].replace(",","")),
             "Data Units Written": ("data_write_bytes"   ,lambda x: x.split(" ")[0].replace(",","")),
             "Power On Hours"    : ("poweronhours"       ,lambda x: x.replace(",","")),
-            "number of hours powered up" :  ("poweronhours" ,lambda x: x.replace(",","")),
             "Power Cycles"      : ("powercycles"        ,lambda x: x.replace(",","")),
             "NVMe Version"      : ("transport"          ,lambda x: f"NVMe {x}"),
             "Raw_Read_Error_Rate"   : ("error_rate"     ,lambda x: x.split(" ")[-1].replace(",","")),
@@ -909,7 +940,8 @@ class smart_disc(object):
             "Critical Comp. Temp. Threshold"    : ("temperature_crit"   ,lambda x: x.split(" ")[0]),
             "Media and Data Integrity Errors"   : ("media_errors"       ,lambda x: x),
             "Airflow_Temperature_Cel"           : ("temperature"        ,lambda x: x),
-            "number of hours powered up"        : ("poweronhours"       ,lambda x: x.split(".")[0]),
+            "number of hours powered up"        : ("poweronhours" ,lambda x: x.split(".")[0]),
+            "Accumulated power on time, hours" : ("poweronhours" ,lambda x: x.split(":")[0].replace("minutes ","")),
             "Accumulated start-stop cycles"     : ("powercycles"        ,lambda x: x),
             "Available Spare"                   : ("wearoutspare"       ,lambda x: x.replace("%","")),
             "SMART overall-health self-assessment test result" : ("smart_status" ,lambda x: int(x.lower().strip() == "passed")),
@@ -957,6 +989,8 @@ class smart_disc(object):
             return ""
         if not getattr(self,"model_type",None):
             self.model_type = getattr(self,"model_family","unknown")
+        if not getattr(self,"model_family",None):
+            self.model_type = getattr(self,"model_type","unknown")
         for _k,_v in self.__dict__.items():
             if _k.startswith("_") or _k in ("device"): 
                 continue
@@ -1003,6 +1037,8 @@ if __name__ == "__main__":
         help=_("path to pid file"))
     _parser.add_argument("--onlyfrom",type=str,
         help=_("comma seperated ip addresses to allow"))
+    _parser.add_argument("--expire_inventory",type=int,default=3600*4,
+        help=_("number of seconds for inventory expire (default 4h)"))
     _parser.add_argument("--skipcheck",type=str,
         help=_("R|comma seperated checks that will be skipped \n{0}".format("\n".join([", ".join(_checks_available[i:i+10]) for i in range(0,len(_checks_available),10)]))))
     _parser.add_argument("--debug",action="store_true",
@@ -1027,6 +1063,8 @@ if __name__ == "__main__":
                 args.encrypt = _v
             if _k == "onlyfrom":
                 args.onlyfrom = _v
+            if _k == "expire_inventory":
+                args.expire_inventory = _v
             if _k == "skipcheck":
                 args.skipcheck = _v
             if _k.lower() == "localdir":
